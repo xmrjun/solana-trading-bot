@@ -15,14 +15,41 @@ import {
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import { Mutex } from 'async-mutex';
+import BN from 'bn.js';
+import * as fs from 'fs';
+import * as path from 'path';
 import { MarketCache, PoolCache, SnipeListCache } from './cache';
 import { PoolFilters } from './filters';
 import { TransactionExecutor } from './transactions';
 import { createPoolKeys, logger, NETWORK, sleep } from './helpers';
-import { Mutex } from 'async-mutex';
-import BN from 'bn.js';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
+
+// 定义日志消息类型
+interface LogMessage {
+  mint?: string;
+  signature?: string;
+  error?: any;
+  [key: string]: any;
+}
+
+// 定义交易记录接口
+interface TradeRecord {
+  timestamp: string;
+  token_address: string;
+  token_symbol: string;
+  buy_price_usdt: number;
+  sell_price_usdt: number;
+  profit_percentage: number;
+  volume_usdt: number;
+  liquidity_usdt: number;
+  volatility: number;
+  gas_fee_usdt: number;
+  slippage: number;
+  transaction_hash?: string;
+  sol_usdt_price: number;
+}
 
 export interface BotConfig {
   wallet: Keypair;
@@ -56,15 +83,16 @@ export interface BotConfig {
 
 export class Bot {
   private readonly poolFilters: PoolFilters;
-
-  // snipe list
   private readonly snipeListCache?: SnipeListCache;
-
-  // one token at the time
   private readonly mutex: Mutex;
   private sellExecutionCount = 0;
+  private priceHistory: { [key: string]: number[] } = {};
+  private tradeHistory: { [key: string]: TradeRecord[] } = {};
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
+  private readonly priceCache: Map<string, { price: number; timestamp: number }> = new Map();
+  private readonly poolInfoCache: Map<string, { info: any; timestamp: number }> = new Map();
+  private readonly CACHE_TTL = 60 * 1000; // 1分钟缓存
 
   constructor(
     private readonly connection: Connection,
@@ -87,6 +115,12 @@ export class Bot {
       this.snipeListCache = new SnipeListCache();
       this.snipeListCache.init();
     }
+
+    // 确保数据目录存在
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
   }
 
   async validate() {
@@ -98,8 +132,192 @@ export class Bot {
       );
       return false;
     }
-
     return true;
+  }
+
+  private async getSolUsdtPrice(): Promise<number> {
+    try {
+      // 使用完整的 USDT/SOL 池子配置
+      const usdtSolPoolKeys: LiquidityPoolKeysV4 = {
+        id: new PublicKey('58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'),
+        baseMint: new PublicKey('So11111111111111111111111111111111111111112'),
+        quoteMint: new PublicKey('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'),
+        lpMint: new PublicKey('8HoQnePLqPj4M7PUDzfw8e3Ymdwgc7NLGnaTUapubyvu'),
+        baseDecimals: 9,
+        quoteDecimals: 6,
+        lpDecimals: 9,
+        version: 4,
+        programId: new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'),
+        authority: new PublicKey('5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1'),
+        openOrders: new PublicKey('HRk9CMrpq7Jn9sh7mzxE8CChHG8dneX9p475QKz4Fsfc'),
+        targetOrders: new PublicKey('CZza3Ej4Mc58MnxWA385itCC9jCo3L1D7zc3LKy1bZMR'),
+        baseVault: new PublicKey('DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz'),
+        quoteVault: new PublicKey('HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz'),
+        withdrawQueue: new PublicKey('G7xeGGGyvX3DmF1VK5C1qQvxVxqQJfYxVxqQJfYxVxqQ'),
+        lpVault: new PublicKey('7GjuoekUxM9DJmzJKDbM9YZUua65JShfFwsdutVSAAYQ'),
+        marketVersion: 3,
+        marketProgramId: new PublicKey('srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX'),
+        marketId: new PublicKey('9wFFyRfZBsuAha4YcuxcXLKwMxJR43S7fPfQLusDBzvT'),
+        marketAuthority: new PublicKey('14ivtgssEBoBjuZJtSAPKYgpUK7hYFhqVqVqVqVqVqVq'),
+        marketBaseVault: new PublicKey('20G81Fg5aym2Cx5Ua9XmW7iU8P3UytiLfLfLfLfLfLf'),
+        marketQuoteVault: new PublicKey('6U6U59zmFWrPSzm9sLX7kVkaK78Kz7XJYkYkYkYkYkYk'),
+        marketBids: new PublicKey('14ivtgssEBoBjuZJtSAPKYgpUK7hYFhqVqVqVqVqVqVq'),
+        marketAsks: new PublicKey('14ivtgssEBoBjuZJtSAPKYgpUK7hYFhqVqVqVqVqVqVq'),
+        marketEventQueue: new PublicKey('14ivtgssEBoBjuZJtSAPKYgpUK7hYFhqVqVqVqVqVqVq'),
+        lookupTableAccount: new PublicKey('9wFFyRfZBsuAha4YcuxcXLKwMxJR43S7fPfQLusDBzvT')
+      };
+
+      const poolInfo = await Liquidity.fetchInfo({
+        connection: this.connection,
+        poolKeys: usdtSolPoolKeys
+      });
+      return poolInfo.quoteReserve.toNumber() / poolInfo.baseReserve.toNumber();
+    } catch (error) {
+      logger.error({ error }, '获取 SOL/USDT 价格失败，使用回退价格');
+      return 150; // 回退价格
+    }
+  }
+
+  private async getTokenInfo(mint: PublicKey): Promise<{ symbol: string; decimals: number } | null> {
+    try {
+      // 使用 gmgn.ai API 获取代币信息
+      const response = await fetch(`https://gmgn.ai/sol/address/${mint.toString()}`);
+      const data = await response.json();
+      
+      if (data && data.symbol) {
+        return {
+          symbol: data.symbol,
+          decimals: data.decimals || 9
+        };
+      }
+    } catch (error) {
+      logger.error({ error, mint: mint.toString() }, '获取代币信息失败');
+    }
+    return null;
+  }
+
+  private async logTransaction(
+    tokenAddress: string,
+    tokenSymbol: string,
+    buyPrice: number,
+    sellPrice: number,
+    profitPercentage: number,
+    volume: number,
+    liquidity: number,
+    transactionHash?: string
+  ) {
+    const timestamp = new Date().toISOString();
+    const volatility = this.calculateVolatility(tokenAddress, buyPrice || sellPrice || 0.01);
+    const solUsdtPrice = await this.getSolUsdtPrice();
+    
+    // 转换为 USDT 价格
+    const buyPriceUsdt = buyPrice * solUsdtPrice;
+    const sellPriceUsdt = sellPrice * solUsdtPrice;
+    
+    // 修正交易量计算
+    const volumeInSol = volume / 1e9; // 转换为 SOL
+    const volumeUsdt = volumeInSol * solUsdtPrice;
+    
+    // 修正流动性计算
+    const liquidityInSol = liquidity / 1e9; // 转换为 SOL
+    const liquidityUsdt = liquidityInSol * solUsdtPrice;
+    
+    const gasFeeUsdt = this.config.unitPrice * solUsdtPrice / 1e9;
+    
+    // 计算利润
+    const profitUsdt = sellPriceUsdt - buyPriceUsdt;
+    const actualProfitPercentage = buyPriceUsdt > 0 ? (profitUsdt / buyPriceUsdt) * 100 : 0;
+    
+    const trade: TradeRecord = {
+      timestamp,
+      token_address: tokenAddress,
+      token_symbol: tokenSymbol,
+      buy_price_usdt: buyPriceUsdt,
+      sell_price_usdt: sellPriceUsdt,
+      profit_percentage: actualProfitPercentage,
+      volume_usdt: volumeUsdt,
+      liquidity_usdt: liquidityUsdt,
+      volatility,
+      gas_fee_usdt: gasFeeUsdt,
+      slippage: this.config.sellSlippage,
+      transaction_hash: transactionHash,
+      sol_usdt_price: solUsdtPrice
+    };
+
+    // 保存到内存中
+    if (!this.tradeHistory[tokenAddress]) {
+      this.tradeHistory[tokenAddress] = [];
+    }
+    this.tradeHistory[tokenAddress].push(trade);
+
+    // 保存到文件
+    const date = new Date().toISOString().split('T')[0];
+    const dataPath = path.join(process.cwd(), 'data', `trades_${date}.json`);
+    fs.appendFileSync(dataPath, JSON.stringify(trade) + '\n');
+
+    // 更新 all_trades.json
+    this.saveAllTradeData();
+
+    // 格式化输出
+    const timeAgo = this.getTimeAgo(new Date(timestamp));
+    console.log(`
+${buyPrice ? '买入' : '卖出'}
+
+代币: ${tokenSymbol}
+总价值: $${volumeUsdt.toFixed(2)}
+数量: ${volumeInSol.toFixed(2)}
+价格: $${(buyPriceUsdt || sellPriceUsdt).toFixed(6)}
+${sellPrice ? `利润: ${profitUsdt >= 0 ? '+' : ''}$${profitUsdt.toFixed(2)}` : ''}
+时间: ${timeAgo}
+交易哈希: ${transactionHash}
+    `);
+  }
+
+  private getTimeAgo(date: Date): string {
+    const seconds = Math.floor((new Date().getTime() - date.getTime()) / 1000);
+    
+    if (seconds < 60) {
+      return `${seconds}秒前`;
+    }
+    
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) {
+      return `${minutes}分钟前`;
+    }
+    
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+      return `${hours}小时前`;
+    }
+    
+    const days = Math.floor(hours / 24);
+    return `${days}天前`;
+  }
+
+  private calculateVolatility(tokenAddress: string, currentPrice: number): number {
+    if (!this.priceHistory[tokenAddress]) {
+      this.priceHistory[tokenAddress] = [];
+    }
+
+    this.priceHistory[tokenAddress].push(currentPrice);
+    if (this.priceHistory[tokenAddress].length > 10) {
+      this.priceHistory[tokenAddress].shift();
+    }
+
+    if (this.priceHistory[tokenAddress].length < 2) return 0.01;
+
+    const returns = this.priceHistory[tokenAddress]
+      .slice(1)
+      .map((p, i) => (p - this.priceHistory[tokenAddress][i]) / this.priceHistory[tokenAddress][i]);
+    
+    const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+    const variance = returns.reduce((sum, r) => sum + (r - mean) ** 2, 0) / returns.length;
+    return Math.sqrt(variance) || 0.01;
+  }
+
+  public saveAllTradeData() {
+    const dataPath = path.join(process.cwd(), 'data', 'all_trades.json');
+    fs.writeFileSync(dataPath, JSON.stringify(this.tradeHistory, null, 2));
   }
 
   public async buy(accountId: PublicKey, poolState: LiquidityStateV4) {
@@ -171,7 +389,6 @@ export class Bot {
               },
               `Confirmed buy tx`,
             );
-
             break;
           }
 
@@ -282,7 +499,6 @@ export class Bot {
     }
   }
 
-  // noinspection JSUnusedLocalSymbols
   private async swap(
     poolKeys: LiquidityPoolKeysV4,
     ataIn: PublicKey,
@@ -299,6 +515,10 @@ export class Bot {
       connection: this.connection,
       poolKeys,
     });
+
+    // 获取代币信息
+    const tokenInfo = await this.getTokenInfo(poolKeys.baseMint);
+    const tokenSymbol = tokenInfo?.symbol || 'UNKNOWN';
 
     const computedAmountOut = Liquidity.computeAmountOut({
       poolKeys,
@@ -351,7 +571,37 @@ export class Bot {
     const transaction = new VersionedTransaction(messageV0);
     transaction.sign([wallet, ...innerTransaction.signers]);
 
-    return this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
+    const result = await this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
+
+    // 添加日志记录
+    if (result.confirmed) {
+      const tokenAddress = poolKeys.baseMint.toString();
+      const quantity = amountIn.raw.toNumber();
+      
+      // 计算价格
+      const priceSol = direction === 'buy'
+        ? poolInfo.quoteReserve.toNumber() / poolInfo.baseReserve.toNumber()
+        : poolInfo.baseReserve.toNumber() / poolInfo.quoteReserve.toNumber();
+      
+      const liquidity = poolInfo.baseReserve.toNumber() * poolInfo.quoteReserve.toNumber();
+      
+      // 计算买入和卖出价格
+      const buyPrice = direction === 'buy' ? priceSol : 0;
+      const sellPrice = direction === 'sell' ? priceSol : 0;
+      
+      await this.logTransaction(
+        tokenAddress,
+        tokenSymbol,
+        buyPrice,
+        sellPrice,
+        0, // 初始利润百分比
+        quantity,
+        liquidity,
+        result.signature
+      );
+    }
+
+    return result;
   }
 
   private async filterMatch(poolKeys: LiquidityPoolKeysV4) {
@@ -442,4 +692,17 @@ export class Bot {
       }
     } while (timesChecked < timesToCheck);
   }
-}
+
+  private formatNumber(num: number): string {
+    if (num >= 1e12) {
+      return `${(num / 1e12).toFixed(2)}T`;
+    } else if (num >= 1e9) {
+      return `${(num / 1e9).toFixed(2)}B`;
+    } else if (num >= 1e6) {
+      return `${(num / 1e6).toFixed(2)}M`;
+    } else if (num >= 1e3) {
+      return `${(num / 1e3).toFixed(2)}K`;
+    }
+    return num.toFixed(2);
+  }
+} 
